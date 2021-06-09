@@ -1,0 +1,115 @@
+#pragma once
+
+/// @file
+/// @brief 
+
+#include <pq_conn.h>
+#include <pq_task.h>
+#include <common/error.h>
+#include <common/thread.h>
+#include <boost/asio.hpp>
+#include <spdlog/spdlog.h>
+#include <forward_list>
+#include <deque>
+#include <string>
+
+namespace ba = boost::asio;
+using ba::ip::tcp;
+
+class PqContext
+{
+public:
+    PqContext( const char* conn_str, int poolSize = 1 )
+        : thread_( "PgAsyncThread" )
+    {
+        for ( int i = 0; i < poolSize; ++i )
+        {
+            pool_.emplace_front( io_context_, conn_str, queue_ );
+        }
+
+        thread_ = Thread( "PgAsyncThread", [ this ]
+            {
+                spdlog::debug( "Thread {} started", Thread::Name() );
+                try
+                {
+                    io_context_.run();
+                }
+                catch ( const Error& e )
+                {
+                    spdlog::error( "{}", e.What() );
+                }
+                catch ( const std::exception& e )
+                {
+                    spdlog::error( "Непредвиденная ошибка: \"{}\"", e.what() );
+                }
+                spdlog::debug( "count = {}", count );
+            } );
+        thread_.Start();
+    }
+
+    ~PqContext()
+    {
+        thread_.Stop( [ this ] { io_context_.stop(); } );
+    }
+
+    std::future<std::string> Exec( const std::string& q )
+    {
+        bool ready = false;
+        for ( auto& dbConn : pool_ )
+        {
+            if ( dbConn.GetState() != PqConn::State::None )
+            {
+                ready = true;
+                break;
+            }
+        }
+
+        std::promise<std::string> p;
+        std::future<std::string> f = p.get_future();
+
+        if ( !ready )
+        {
+            try
+            {
+                throw std::runtime_error( "not ready" );
+            }
+            catch( std::exception& e )
+            {
+                p.set_exception( std::current_exception() );
+            }
+        }
+        else
+        {
+            ba::post( io_context_, [ this, q = std::move(q), p = std::move(p) ]() mutable
+                {
+                    if ( queue_.size() > 100 )
+                    {
+                        try
+                        {
+                            throw std::runtime_error( "too many" );
+                        }
+                        catch( std::exception& e )
+                        {
+                            p.set_exception( std::current_exception() );
+                        }
+                    }
+                    queue_.push_back( Task{ std::move(q), std::move(p), "" } );
+                    for ( auto& dbConn : pool_ )
+                    {
+                        if ( dbConn.GetState() == PqConn::State::Idle )
+                        {
+                            dbConn.Process();
+                            break;
+                        }
+                    }
+                } );
+        }
+        return f;
+    }
+
+private:
+    ba::io_context io_context_;
+    Thread thread_;
+    std::forward_list<PqConn> pool_;
+    std::deque<Task> queue_;
+};

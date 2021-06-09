@@ -1,0 +1,14 @@
+#pragma once
+
+/// @file
+/// @brief 
+
+#include <future>
+#include <string>
+
+struct Task
+{
+    std::string query;
+    std::promise<std::string> promise;
+    std::string result;
+};
